@@ -1,0 +1,241 @@
+From 7847757c9be40e60a6411f54b85c737b24a00d6e Mon Sep 17 00:00:00 2001
+From: fikretabi034-art <335198653+fikretabi034-art@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 20:57:26 +0000
+Subject: [PATCH] Bootstrap active roulette history after archive gaps and hide
+ empty predictions
+
+Co-authored-by: arena-agent <297053741+arena-agent@users.noreply.github.com>
+---
+ README.md                |  2 +
+ roulette_v1.py           | 84 ++++++++++++++++++++++++++++++++++------
+ test_roulette_refresh.py | 42 ++++++++++++++++++++
+ 3 files changed, 117 insertions(+), 11 deletions(-)
+
+diff --git a/README.md b/README.md
+index c671d4d..5a698f4 100644
+--- a/README.md
++++ b/README.md
+@@ -6,4 +6,6 @@ Her masa kendi `tableId` kimliğiyle, kullanıcının `PragmaticRouletteTracker`
+ 
+ **GEÇMİŞ, 1 KOMŞU, 2 KOMŞU** karşılaştırmaları yalnızca *önceden gösterilmiş tahminin ardından doğrulanmış gerçek sonuçlarla* puanlanır. Toplanan eski 500 spin geçmişe dönük tahmin başarısı olarak sayılmaz. Bu üç görünümün son 12'lik listeleri uygulama yeniden açıldığında da geri gelir. Rastgele rulette geçmiş frekanslar gelecekteki sonuçları garanti etmez.
+ 
++Canlı sonuç henüz okunmadıysa tahmin yerine `--` gösterilir; üstteki **CANLI VERİ** satırı ve **VERİ** sekmesi bağlantı/masa kimliği/SON500 durumunu gösterir. Uzun süre kapalı kalmış bir masanın yeni SON500 penceresi eski arşivle hiç örtüşmüyorsa eski arşiv `*_onceki_*.json` adıyla saklanır, yeni pencere ayrı bir dönem olarak başlatılır; bilinmeyen aradaki spinler uydurularak eklenmez. Bir tahminin GEÇMİŞ/K1/K2 karşılaştırmasına girmesi için ardından yeni ve doğrulanmış bir sonuç gelmesi gerekir.
++
+ Çevrimdışı regresyon testleri: `python -m unittest -v test_roulette_refresh.py`. Tarayıcı/oyun sitesinin canlı davranışı bu testlerde simüle edilmez.
+diff --git a/roulette_v1.py b/roulette_v1.py
+index d90624e..0f6fb01 100644
+--- a/roulette_v1.py
++++ b/roulette_v1.py
+@@ -4872,11 +4872,35 @@ class RouletteState:
+             base = previous_500 or self.table_long_history[:500]
+             added = detect_new_front_large(base, clean, max_new=500)
+             extended = (len(clean) > len(base) and clean[:len(base)] == base)
++            new_epoch = False
+             if base and clean != base and not added and not extended:
+-                # A later stale/disjoint response must not erase the last
+-                # verified SON500 or contaminate the same-table long archive.
+-                self.table_history_source = "MASA SON500: örtüşme doğrulanamadı"
+-                return
++                # On a fresh process start, the old archive can be >500 spins
++                # behind the actual table. Such a gap cannot be merged, but it
++                # must not prevent today's verified SON500 from bootstrapping
++                # SON SAYI and the next-round K1/K2 comparison. Preserve the
++                # old archive as a separate epoch before starting a new one.
++                if (not previous_500 and self.pragmatic_table_id
++                        and len(clean) >= 100
++                        and (not self.history or live_alignment)):
++                    path = table_long_archive_path(self.data_dir, incoming_table)
++                    try:
++                        if os.path.exists(path):
++                            stamp = int(time.time())
++                            backup = path[:-5] + f"_onceki_{stamp}.json"
++                            while os.path.exists(backup):
++                                stamp += 1
++                                backup = path[:-5] + f"_onceki_{stamp}.json"
++                            shutil.copy2(path, backup)
++                        self.table_long_history = []
++                        new_epoch = True
++                    except OSError:
++                        self.table_history_source = "SON500: eski arşiv yedeklenemedi"
++                        return
++                else:
++                    # Out-of-order or unrelated replies while already tracking
++                    # a window must not replace the anchor or be scored.
++                    self.table_history_source = "MASA SON500: örtüşme doğrulanamadı"
++                    return
+             if clean == previous_500 and not verified_live_new:
+                 # HISTORY500_SCAN runs repeatedly. Rewriting the whole archive
+                 # and recomputing walk-forward on every identical reply held
+@@ -4901,7 +4925,10 @@ class RouletteState:
+             self.table_history_500 = clean
+             self.table_history_table = incoming_table
+             self.table_history_last_update = time.time()
+-            self.table_history_source = f"{source_label}: {len(clean)}/500"
++            self.table_history_source = (
++                f"{source_label}: {len(clean)}/500"
++                + (" • YENİ DÖNEM (eski arşiv korundu)" if new_epoch else "")
++            )
+             self.table_long_source = (
+                 f"UZUN MASA ARŞİVİ: {len(self.table_long_history)}"
+                 + (f" (+{added_count})" if added_count else "")
+@@ -6033,10 +6060,12 @@ class RouletteState:
+                 self.pending_prediction = self._make_prediction(h)
+             pred = self.pending_prediction
+ 
++            # An empty model still produces numerical defaults. They are not
++            # observations or valid predictions: do not display/score them.
+             watch = [
+                 (n, pred["combined"][n])
+                 for n in pred["top5"]
+-            ]
++            ] if h else []
+ 
+             recent20 = rolling_rates(self.validation_history, 20)
+             wf_profile = pred.get("walkforward") or self._get_walkforward_profile()
+@@ -6164,7 +6193,7 @@ class RouletteState:
+                 "quality": str(quality),
+                 "region": str(cal_region_name),
+                 "source_count": len(source_answers),
+-            }
++            } if h else {}
+ 
+             return {
+                 "chrome": self.chrome_connected,
+@@ -10144,6 +10173,18 @@ class ChromeBridge(threading.Thread):
+             return False
+         return (not self.active_game_sid) or sid == self.active_game_sid
+ 
++    def _should_scan_live_session(self, sid):
++        """A Pragmatic game iframe can have a generic title, not 'roulette'."""
++        if not self._is_active_session(sid) or not self.is_direct_probe_target(sid):
++            return False
++        info = self.session_info.get(sid, {}) or {}
++        url = str(info.get("url", "") or "").lower()
++        return (self.is_roulette_target(sid)
++                or sid == self.active_game_sid
++                or any(path in url for path in (
++                    "/desktop/", "/gs2c/game/", "/game.do",
++                )))
++
+     def scan_dom_loop(self):
+         last_500_scan = {}
+         last_background_scan = {}
+@@ -10303,7 +10344,7 @@ class ChromeBridge(threading.Thread):
+                                 context=sid,
+                             )
+ 
+-                    if self.is_roulette_target(sid) and self._is_active_session(sid):
++                    if self._should_scan_live_session(sid):
+                         self.send(
+                             "Runtime.evaluate",
+                             {
+@@ -12484,6 +12525,11 @@ class App:
+         self.confidence.pack()
+         self.quality_line = tk.Label(master,text="VERİ MODU: KAYNAKLAR KAYDEDİLİYOR",font=("Segoe UI",9,"bold"),fg=self.GREEN,bg=self.PANEL)
+         self.quality_line.pack()
++        self.live_data_line = tk.Label(
++            master, text="CANLI VERİ: Chrome bekleniyor",
++            font=("Segoe UI", 8, "bold"), fg=self.YELLOW, bg=self.PANEL,
++        )
++        self.live_data_line.pack(pady=(2, 0))
+ 
+         # V2.8.8 - manual play helper only.
+         # These buttons NEVER click the casino UI and NEVER place a bet.
+@@ -13661,6 +13707,17 @@ class App:
+ 
+         h = s["history"]
+         watch = s["watch"]
++        if h:
++            live_status = f"CANLI VERİ: {len(h)} sonuç • SON {h[0]}"
++        elif s.get("chrome"):
++            live_status = (
++                "CANLI VERİ: SON500/masa kimliği bekleniyor"
++                if not s.get("pragmatic_table_id")
++                else "CANLI VERİ: SON500 okunuyor • veri doğrulanmadı"
++            )
++        else:
++            live_status = "CANLI VERİ: Chrome bağlantısı bekleniyor"
++        self.live_data_line.config(text=live_status, fg=self.GREEN if h else self.YELLOW)
+         self.top_last_line.config(text=f"SON: {h[0]}" if h else "SON: --")
+ 
+         if watch:
+@@ -14046,8 +14103,13 @@ class App:
+         else:
+             self.main_pick.config(text="--")
+             self.coverage_line.config(text="TEORİK KAPSAMA: --")
+-            self.action_line.config(text="NET SAYI HESAPLANIYOR", fg=self.BLUE)
+-            self.archive_line.config(text="ARŞİV: dosya yok")
++            self.action_line.config(text="GERÇEK SONUÇ BEKLENİYOR", fg=self.YELLOW)
++            self.archive_line.config(text=(
++                f"{s.get('direct_history_status','PRAGMATIC DIRECT: bekleniyor')}\n"
++                f"MASA KİMLİĞİ: {s.get('pragmatic_table_id') or '-'}\n"
++                f"{s.get('table500_source','SON500: bekleniyor')}\n"
++                f"{s.get('table_scan_status','MASA TARAMA: hazır')}"
++            ))
+             self.consensus_line.config(text="KAYNAK UYUMU: veri bekleniyor")
+             self.instant_line.config(text="YEDEKLER (KAYIT): --")
+             self.history_brain_line.config(text="KAYITLI GEÇMİŞ: veri bekleniyor")
+@@ -14115,7 +14177,7 @@ class App:
+         region_features = s.get("region_features") or {}
+         neigh = s.get("neighbor_zone") or []
+ 
+-        if region_name:
++        if region_name and h:
+             v = round(region_scores.get("VOISINS DU ZÉRO",0.0), 1)
+             t = round(region_scores.get("TIERS DU CYLINDRE",0.0), 1)
+             o = round(100.0 - v - t, 1)
+diff --git a/test_roulette_refresh.py b/test_roulette_refresh.py
+index 4464895..6c0e9ed 100644
+--- a/test_roulette_refresh.py
++++ b/test_roulette_refresh.py
+@@ -98,6 +98,48 @@ class TableRefreshTests(unittest.TestCase):
+         s.update_table_history_500(self.old, table_name="B")
+         self.assertEqual(s.table_long_history, self.old)
+ 
++    def test_empty_view_does_not_advertise_unobserved_predictions(self):
++        snap = self.state.snapshot()
++        self.assertEqual(snap["history"], [])
++        self.assertEqual(snap["watch"], [])
++        self.assertEqual(snap["pending_compare"], {})
++        self.assertEqual(snap["comparison_records"], [])
++        self.assertEqual(snap["neighbor1_records"], [])
++        self.assertEqual(snap["neighbor_records"], [])
++
++    def test_old_disjoint_archive_kept_as_separate_epoch_on_restart(self):
++        s = self.state
++        s.set_pragmatic_identity("A", title="A")
++        s.update_table_history_500(self.old, table_name="A")
++        unrelated = [(i * 17 + 4) % 37 for i in range(500)]
++        restarted = roulette.RouletteState()
++        restarted.set_pragmatic_identity("A", title="A")
++        restarted.update_table_history_500(unrelated, table_name="A")
++        self.assertEqual(restarted.history, unrelated[:20])
++        self.assertEqual(restarted.table_long_history, unrelated)
++        self.assertEqual(roulette.load_table_long_archive(self.temp.name, "pragmatic_A"), unrelated)
++        archived = [name for name in os.listdir(self.temp.name)
++                    if name.startswith("table_long_archive_pragmatic_a_onceki_")]
++        self.assertEqual(len(archived), 1)
++        with open(os.path.join(self.temp.name, archived[0]), encoding="utf-8") as fh:
++            self.assertEqual(json.load(fh)["results_newest_first"], self.old)
++        # A delayed reply from the old epoch must not replace the new window.
++        restarted.update_table_history_500(self.old, table_name="A")
++        self.assertEqual(restarted.table_long_history, unrelated)
++
++    def test_generic_game_iframe_is_probed_but_collector_is_not(self):
++        bridge = object.__new__(roulette.ChromeBridge)
++        bridge.active_game_sid = "game"
++        bridge.session_info = {
++            "game": {"url": "https://client.example/desktop/", "title": "Game", "type": "iframe"},
++            "other": {"url": "https://example.org/", "title": "Casino", "type": "page"},
++        }
++        bridge._is_collector_session = lambda sid: False
++        self.assertTrue(bridge._should_scan_live_session("game"))
++        self.assertFalse(bridge._should_scan_live_session("other"))
++        bridge._is_collector_session = lambda sid: sid == "game"
++        self.assertFalse(bridge._should_scan_live_session("game"))
++
+     def test_repeated_active_scan_does_not_recompute_prediction(self):
+         s = self.state
+         s.set_pragmatic_identity("A", title="A")
+-- 
+2.39.5
