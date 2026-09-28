@@ -98,6 +98,48 @@ class TableRefreshTests(unittest.TestCase):
         s.update_table_history_500(self.old, table_name="B")
         self.assertEqual(s.table_long_history, self.old)
 
+    def test_empty_view_does_not_advertise_unobserved_predictions(self):
+        snap = self.state.snapshot()
+        self.assertEqual(snap["history"], [])
+        self.assertEqual(snap["watch"], [])
+        self.assertEqual(snap["pending_compare"], {})
+        self.assertEqual(snap["comparison_records"], [])
+        self.assertEqual(snap["neighbor1_records"], [])
+        self.assertEqual(snap["neighbor_records"], [])
+
+    def test_old_disjoint_archive_kept_as_separate_epoch_on_restart(self):
+        s = self.state
+        s.set_pragmatic_identity("A", title="A")
+        s.update_table_history_500(self.old, table_name="A")
+        unrelated = [(i * 17 + 4) % 37 for i in range(500)]
+        restarted = roulette.RouletteState()
+        restarted.set_pragmatic_identity("A", title="A")
+        restarted.update_table_history_500(unrelated, table_name="A")
+        self.assertEqual(restarted.history, unrelated[:20])
+        self.assertEqual(restarted.table_long_history, unrelated)
+        self.assertEqual(roulette.load_table_long_archive(self.temp.name, "pragmatic_A"), unrelated)
+        archived = [name for name in os.listdir(self.temp.name)
+                    if name.startswith("table_long_archive_pragmatic_a_onceki_")]
+        self.assertEqual(len(archived), 1)
+        with open(os.path.join(self.temp.name, archived[0]), encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["results_newest_first"], self.old)
+        # A delayed reply from the old epoch must not replace the new window.
+        restarted.update_table_history_500(self.old, table_name="A")
+        self.assertEqual(restarted.table_long_history, unrelated)
+
+    def test_generic_game_iframe_is_probed_but_collector_is_not(self):
+        bridge = object.__new__(roulette.ChromeBridge)
+        bridge.active_game_sid = "game"
+        bridge.session_info = {
+            "game": {"url": "https://client.example/desktop/", "title": "Game", "type": "iframe"},
+            "other": {"url": "https://example.org/", "title": "Casino", "type": "page"},
+        }
+        bridge._is_collector_session = lambda sid: False
+        self.assertTrue(bridge._should_scan_live_session("game"))
+        self.assertFalse(bridge._should_scan_live_session("other"))
+        bridge._is_collector_session = lambda sid: sid == "game"
+        self.assertFalse(bridge._should_scan_live_session("game"))
+
     def test_repeated_active_scan_does_not_recompute_prediction(self):
         s = self.state
         s.set_pragmatic_identity("A", title="A")

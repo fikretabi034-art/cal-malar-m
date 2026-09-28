@@ -6,4 +6,6 @@ Her masa kendi `tableId` kimliğiyle, kullanıcının `PragmaticRouletteTracker`
 
 **GEÇMİŞ, 1 KOMŞU, 2 KOMŞU** karşılaştırmaları yalnızca *önceden gösterilmiş tahminin ardından doğrulanmış gerçek sonuçlarla* puanlanır. Toplanan eski 500 spin geçmişe dönük tahmin başarısı olarak sayılmaz. Bu üç görünümün son 12'lik listeleri uygulama yeniden açıldığında da geri gelir. Rastgele rulette geçmiş frekanslar gelecekteki sonuçları garanti etmez.
 
+Canlı sonuç henüz okunmadıysa tahmin yerine `--` gösterilir; üstteki **CANLI VERİ** satırı ve **VERİ** sekmesi bağlantı/masa kimliği/SON500 durumunu gösterir. Uzun süre kapalı kalmış bir masanın yeni SON500 penceresi eski arşivle hiç örtüşmüyorsa eski arşiv `*_onceki_*.json` adıyla saklanır, yeni pencere ayrı bir dönem olarak başlatılır; bilinmeyen aradaki spinler uydurularak eklenmez. Bir tahminin GEÇMİŞ/K1/K2 karşılaştırmasına girmesi için ardından yeni ve doğrulanmış bir sonuç gelmesi gerekir.
+
 Çevrimdışı regresyon testleri: `python -m unittest -v test_roulette_refresh.py`. Tarayıcı/oyun sitesinin canlı davranışı bu testlerde simüle edilmez.
