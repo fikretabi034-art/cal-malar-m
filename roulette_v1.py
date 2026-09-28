@@ -39,7 +39,8 @@ COLLECTOR_PROBE_STEADY_CONCURRENT = 0
 COLLECTOR_PROBE_SECONDS = 12.0
 COLLECTOR_CARD_CLICK_SECONDS = 10.0
 TABLE_SCAN_AUTO_REFRESH_SECONDS = 600.0
-TAB_WALK_REFRESH_SECONDS = 300.0
+# Start the next full single-tab pass ten minutes after the previous pass ends.
+TAB_WALK_REFRESH_SECONDS = 600.0
 TAB_WALK_TABLE_TIMEOUT_SECONDS = 120.0
 TAB_WALK_TABLE_MIN_DWELL_SECONDS = 4.0
 TAB_WALK_NO_SON500_SKIP_SECONDS = 6.0
@@ -4560,7 +4561,9 @@ class RouletteState:
             row["last_attempt_epoch"] = time.time()
             if error:
                 row["last_error"] = str(error)[:160]
-            elif ok:
+            elif ok and row.get("last_error") != "SON500 örtüşmesi doğrulanamadı":
+                # The caller only knows the HTTP/DOM request succeeded; the
+                # archive itself may have rejected an out-of-order response.
                 row.pop("last_error", None)
             self.table_registry[tid] = row
             self._save_table_registry()
@@ -4702,20 +4705,27 @@ class RouletteState:
             if not long_hist:
                 long_hist = list(clean)
                 added = list(clean)
+                save_table_long_archive(self.data_dir, identity, long_hist)
             else:
                 base = previous if previous else long_hist[:500]
-                added = detect_new_front_large(
-                    base,
-                    clean,
-                    max_new=500,
-                )
+                added = detect_new_front_large(base, clean, max_new=500)
+                extended = (len(clean) > len(base) and clean[:len(base)] == base)
+                if clean != base and not added and not extended:
+                    # Out-of-order API/DOM replies, a reversed grid, or a
+                    # disjoint window cannot be safely appended. Do not replace
+                    # the saved anchor: the next scan may still bridge it.
+                    self.mark_table_attempt(tid, error="SON500 örtüşmesi doğrulanamadı")
+                    return 0
                 if added:
                     long_hist = list(added) + list(long_hist)
+                elif extended and clean[:len(long_hist)] == long_hist:
+                    # The API first sent 20/500, then the complete window:
+                    # these are OLDER spins, not new live outcomes.
+                    long_hist = list(clean) + long_hist[len(clean):]
+                if added or extended:
+                    save_table_long_archive(self.data_dir, identity, long_hist)
 
-            if added:
-                save_table_long_archive(self.data_dir, identity, long_hist)
-
-            if clean != previous:
+            if not previous or clean != previous:
                 try:
                     key = safe_table_key(identity)
                     path = os.path.join(
@@ -4855,28 +4865,37 @@ class RouletteState:
                     incoming_table
                 )
 
-            previous_500 = list(self.table_history_500)
-            new_front = detect_new_front_large(previous_500, clean, max_new=500)
+            previous_500 = (
+                list(self.table_history_500)
+                if self.table_history_table == incoming_table else []
+            )
+            base = previous_500 or self.table_long_history[:500]
+            added = detect_new_front_large(base, clean, max_new=500)
+            extended = (len(clean) > len(base) and clean[:len(base)] == base)
+            if base and clean != base and not added and not extended:
+                # A later stale/disjoint response must not erase the last
+                # verified SON500 or contaminate the same-table long archive.
+                self.table_history_source = "MASA SON500: örtüşme doğrulanamadı"
+                return
+            if clean == previous_500 and not verified_live_new:
+                # HISTORY500_SCAN runs repeatedly. Rewriting the whole archive
+                # and recomputing walk-forward on every identical reply held
+                # the state lock and delayed GEÇMİŞ/K1/K2 live display.
+                self.table_history_last_update = time.time()
+                self.table_history_source = f"{source_label}: {len(clean)}/500"
+                return
 
-            # First capture: seed long archive with all visible SON500 only if
-            # no long archive exists yet. Later captures add only new results.
+            # Seed once; on later scans prepend ONLY the verified new prefix.
             if not self.table_long_history:
                 self.table_long_history = list(clean)
                 added_count = len(clean)
             else:
-                if previous_500:
-                    added = list(new_front)
-                else:
-                    # On restart, compare current SON500 against long archive head.
-                    added = detect_new_front_large(
-                        self.table_long_history[:500],
-                        clean,
-                        max_new=500
-                    )
                 if added:
-                    self.table_long_history = (
-                        added + self.table_long_history
-                    )
+                    self.table_long_history = list(added) + self.table_long_history
+                elif extended and clean[:len(self.table_long_history)] == self.table_long_history:
+                    # Completing a partial SON500 fills older data, not new
+                    # spins. Keep the same chronology without double-counting.
+                    self.table_long_history = list(clean) + self.table_long_history[len(clean):]
                 added_count = len(added)
 
             self.table_history_500 = clean
@@ -5269,6 +5288,39 @@ class RouletteState:
             }
             self.validation_history = list(data.get("validation_history", []))[-300:]
 
+            # GEÇMİŞ, K1 and K2 are three views of the same already-scored
+            # rounds. Restore their visible batches immediately on restart;
+            # never replay old SON500 as if these were new live outcomes.
+            valid = [r for r in self.validation_history if isinstance(r, dict)
+                     and "actual" in r and "predicted" in r]
+            saved_batch = data.get("display_compare_batch")
+            self.display_compare_batch = [dict(r) for r in (
+                saved_batch if isinstance(saved_batch, list) else valid[-12:]
+            ) if isinstance(r, dict)][-12:]
+            for attr, saved_key, row_key in (
+                ("neighbor_display_batch", "neighbor_display_batch", "neighbor_bet"),
+                ("neighbor1_display_batch", "neighbor1_display_batch", "neighbor1_bet"),
+            ):
+                saved = data.get(saved_key)
+                source = saved if isinstance(saved, list) else [
+                    r.get(row_key) for r in self.display_compare_batch
+                ]
+                setattr(self, attr, [dict(r) for r in source
+                                     if isinstance(r, dict) and "actual" in r][-12:])
+            for attr, row_key in (
+                ("last_neighbor1_package", "neighbor1_bet"),
+                ("last_neighbor2_package", "neighbor_bet"),
+            ):
+                last = (valid[-1].get(row_key) or {}) if valid else {}
+                if isinstance(last, dict) and "any_neighbor_hit" in last:
+                    setattr(self, attr, {
+                        "won": bool(last["any_neighbor_hit"]),
+                        "actual": last.get("actual"),
+                        "net": last.get("net"),
+                        "backups": list(last.get("backups") or []),
+                        "coverage": int(last.get("unique_coverage", 0) or 0),
+                    })
+
             raw_locked = data.get("locked_live") or {}
             if str(raw_locked.get("version") or "") == "V2.9 FINAL CORE":
                 self.locked_live = {
@@ -5336,6 +5388,9 @@ class RouletteState:
                 "expert_hits": self.expert_hits,
                 "validation": self.validation,
                 "validation_history": self.validation_history[-300:],
+                "display_compare_batch": self.display_compare_batch[-12:],
+                "neighbor_display_batch": self.neighbor_display_batch[-12:],
+                "neighbor1_display_batch": self.neighbor1_display_batch[-12:],
                 "locked_live": self.locked_live,
                 "neighbor_stats_total": self.neighbor_stats_total,
                 "neighbor1_stats_total": self.neighbor1_stats_total,
@@ -5822,16 +5877,19 @@ class RouletteState:
         """Clear only the visible 01..12 list; keep all learning/performance."""
         with self.lock:
             self.display_compare_batch = []
+            self._save_learning()
 
     def clear_neighbor_comparisons(self):
         """Clear only visible KOMŞU rows; keep accumulated stats/learning."""
         with self.lock:
             self.neighbor_display_batch = []
+            self._save_learning()
 
     def clear_neighbor1_comparisons(self):
         """Clear only visible 1 KOMŞU rows; keep accumulated stats/learning."""
         with self.lock:
             self.neighbor1_display_batch = []
+            self._save_learning()
 
 
     def update_results(self, results, hot=None, cold=None, table_name="", source="API"):
@@ -5969,11 +6027,11 @@ class RouletteState:
             ]
             cold_calc = [n for n in range(37) if n not in freq][:5]
 
-            pred = (
-                self.pending_prediction
-                if self.pending_prediction is not None
-                else self._make_prediction(h)
-            )
+            if self.pending_prediction is None:
+                # An empty/uninitialized view used to run the full model on
+                # every 250 ms Tk refresh, starving incoming live results.
+                self.pending_prediction = self._make_prediction(h)
+            pred = self.pending_prediction
 
             watch = [
                 (n, pred["combined"][n])
@@ -8770,7 +8828,7 @@ class ChromeBridge(threading.Thread):
         The user keeps playing in their own tab. This collector tab enters the
         Pragmatic lobby, clicks one real table card, waits on the lower-right
         SON 500 panel above Automatic Play, saves it, returns to lobby, then
-        clicks the next table. A completed pass repeats every 5 minutes.
+        clicks the next table. A completed pass repeats ten minutes after it finishes.
         """
         self._close_table_scan_target()
         self.chrome_dga_enabled = False
@@ -12594,7 +12652,7 @@ class App:
         tabwalk_bar=tk.Frame(data,bg=self.PANEL)
         tabwalk_bar.pack(fill="x",padx=8,pady=(0,5))
         tk.Button(
-            tabwalk_bar,text="TEK SEKME LOBİ TOPLA • 5 DK",command=self.start_tab_walk_scan_ui,
+            tabwalk_bar,text="TEK SEKME LOBİ TOPLA • 10 DK",command=self.start_tab_walk_scan_ui,
             font=("Segoe UI",8,"bold"),bg=self.PANEL2,fg=self.BLUE,
             activebackground=self.PANEL2,activeforeground=self.GREEN,
             relief="flat",bd=0,padx=7,pady=5,cursor="hand2",
