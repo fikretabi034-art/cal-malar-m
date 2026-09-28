@@ -12,7 +12,7 @@ KONTROL
 
 KULLANIM
 1. VERİ panelinden şuna bas:
-   TEK SEKME LOBİ TOPLA • 5 DK
+   TEK SEKME LOBİ TOPLA • 10 DK
 2. Masa açıldığında SON500 paneli görünüyorsa program artık masayı lobi sanmaz.
 3. 'masa açık • SON500 paneli görüldü • 500 spin okunuyor' yazısından sonra 500/500 veri kaydı yapılır.
 4. Veri alınınca oyun içi Lobi düğmesine basar ve sıradaki masaya geçer.
